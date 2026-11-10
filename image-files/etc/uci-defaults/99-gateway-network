@@ -1,0 +1,13 @@
+#!/bin/sh
+# Configuration reseau initiale de la passerelle.
+# Execute une seule fois au premier demarrage, puis supprime.
+
+# Interface WAN en DHCP sur eth1, si elle n'existe pas deja
+if ! uci -q get network.wan > /dev/null; then
+    uci set network.wan=interface
+    uci set network.wan.device='eth1'
+    uci set network.wan.proto='dhcp'
+    uci commit network
+fi
+
+exit 0
