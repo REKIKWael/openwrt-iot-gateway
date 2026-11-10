@@ -1,13 +1,19 @@
 /*
  * iotd - IoT gateway status publisher
- * v2 : connexion MQTT, publication periodique et reprise automatique
+ * v3 : etat reseau en JSON, disponibilite (LWT) et arret propre
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <time.h>
 #include <unistd.h>
+#include <signal.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <uci.h>
 #include <mosquitto.h>
 
@@ -19,12 +25,29 @@ struct iotd_config {
     int  interval;
 };
 
-/* Lit une option UCI de type texte.
- * Retourne 0 si trouvee, -1 sinon (out n'est alors pas modifie). */
+/* Contexte de l'application, transmis aux callbacks libmosquitto */
+struct iotd_app {
+    struct iotd_config cfg;
+    char avail_topic[160];      /* <topic>/availability : online / offline */
+};
+
+/* Mis a 0 par le gestionnaire de signal pour demander l'arret */
+static volatile sig_atomic_t g_running = 1;
+
+static void on_signal(int sig)
+{
+    (void)sig;
+    g_running = 0;              /* le strict minimum dans un gestionnaire */
+}
+
+/* ------------------------------------------------------------------ */
+/* Configuration UCI                                                   */
+/* ------------------------------------------------------------------ */
+
 static int uci_read_string(struct uci_context *ctx, const char *path,
                            char *out, size_t out_len)
 {
-    char buf[128];          /* copie modifiable : uci_lookup_ptr decoupe la chaine */
+    char buf[128];
     struct uci_ptr ptr;
 
     snprintf(buf, sizeof(buf), "%s", path);
@@ -40,8 +63,6 @@ static int uci_read_string(struct uci_context *ctx, const char *path,
     return 0;
 }
 
-/* Lit une option UCI et la convertit en entier.
- * Retourne 0 si OK, -1 si absente ou invalide (out n'est alors pas modifie). */
 static int uci_read_int(struct uci_context *ctx, const char *path, int *out)
 {
     char txt[32];
@@ -63,7 +84,6 @@ static int load_config(struct iotd_config *cfg)
 {
     struct uci_context *ctx;
 
-    /* Valeurs par defaut : utilisees si une option manque */
     cfg->enabled  = 1;
     snprintf(cfg->broker, sizeof(cfg->broker), "%s", "127.0.0.1");
     cfg->port     = 1883;
@@ -98,8 +118,10 @@ static int load_config(struct iotd_config *cfg)
     return 0;
 }
 
-/* Secondes ecoulees depuis le demarrage, horloge monotone :
- * elle ne recule jamais, meme si NTP corrige l'heure. */
+/* ------------------------------------------------------------------ */
+/* Etat du systeme                                                     */
+/* ------------------------------------------------------------------ */
+
 static time_t now_monotonic(void)
 {
     struct timespec ts;
@@ -108,7 +130,6 @@ static time_t now_monotonic(void)
     return ts.tv_sec;
 }
 
-/* Lit l'uptime du systeme dans /proc/uptime (premiere valeur, en secondes). */
 static int read_uptime(double *uptime)
 {
     FILE *f = fopen("/proc/uptime", "r");
@@ -121,20 +142,102 @@ static int read_uptime(double *uptime)
     return (n == 1) ? 0 : -1;
 }
 
-/* Appelee par libmosquitto quand le broker repond au CONNECT (CONNACK). */
-static void on_connect(struct mosquitto *mosq, void *userdata, int rc)
+/* Ajoute du texte formate a la fin de buf, sans jamais deborder.
+ * Retourne -1 si le buffer est trop petit. */
+static int buf_append(char *buf, size_t len, size_t *off, const char *fmt, ...)
 {
-    (void)mosq;
-    (void)userdata;
+    va_list ap;
+    int n;
 
-    if (rc == 0)
-        fprintf(stderr, "iotd: connected to broker\n");
-    else
-        fprintf(stderr, "iotd: connection refused: %s\n",
-                mosquitto_connack_string(rc));
+    if (*off >= len)
+        return -1;
+
+    va_start(ap, fmt);
+    n = vsnprintf(buf + *off, len - *off, fmt, ap);
+    va_end(ap);
+
+    if (n < 0 || (size_t)n >= len - *off)
+        return -1;              /* resultat tronque */
+
+    *off += (size_t)n;
+    return 0;
 }
 
-/* Appelee quand la connexion est perdue ou fermee. */
+/* Construit l'etat de la passerelle en JSON :
+ * {"hostname":"OpenWrt","uptime":1234,"interfaces":[{"name":"eth1","ipv4":"10.0.2.15"}]}
+ * Les noms d'hote et d'interface ne contiennent pas de caracteres
+ * a echapper en JSON. */
+static int build_status_json(char *buf, size_t len)
+{
+    struct ifaddrs *list, *ifa;
+    char host[64];
+    char addr[INET_ADDRSTRLEN];
+    double uptime = 0.0;
+    size_t off = 0;
+    bool first = true;
+    int rc = 0;
+
+    if (gethostname(host, sizeof(host)) != 0)
+        snprintf(host, sizeof(host), "%s", "unknown");
+    host[sizeof(host) - 1] = '\0';
+
+    read_uptime(&uptime);
+
+    if (buf_append(buf, len, &off,
+                   "{\"hostname\":\"%s\",\"uptime\":%.0f,\"interfaces\":[",
+                   host, uptime) != 0)
+        return -1;
+
+    if (getifaddrs(&list) == 0) {
+        for (ifa = list; ifa != NULL; ifa = ifa->ifa_next) {
+            struct sockaddr_in *sin;
+
+            if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET)
+                continue;
+            if (ifa->ifa_flags & IFF_LOOPBACK)
+                continue;
+
+            sin = (struct sockaddr_in *)ifa->ifa_addr;
+            inet_ntop(AF_INET, &sin->sin_addr, addr, sizeof(addr));
+
+            if (buf_append(buf, len, &off, "%s{\"name\":\"%s\",\"ipv4\":\"%s\"}",
+                           first ? "" : ",", ifa->ifa_name, addr) != 0) {
+                rc = -1;
+                break;
+            }
+            first = false;
+        }
+        freeifaddrs(list);      /* liberer la liste allouee par getifaddrs */
+    }
+
+    if (rc == 0)
+        rc = buf_append(buf, len, &off, "]}");
+
+    return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* Callbacks MQTT                                                      */
+/* ------------------------------------------------------------------ */
+
+static void on_connect(struct mosquitto *mosq, void *userdata, int rc)
+{
+    struct iotd_app *app = userdata;
+
+    if (rc != 0) {
+        fprintf(stderr, "iotd: connection refused: %s\n",
+                mosquitto_connack_string(rc));
+        return;
+    }
+
+    fprintf(stderr, "iotd: connected to broker\n");
+
+    /* Annonce la disponibilite. Message retenu : un nouvel abonne
+     * connait immediatement l'etat de la passerelle. */
+    mosquitto_publish(mosq, NULL, app->avail_topic,
+                      (int)strlen("online"), "online", 1, true);
+}
+
 static void on_disconnect(struct mosquitto *mosq, void *userdata, int rc)
 {
     (void)mosq;
@@ -143,27 +246,46 @@ static void on_disconnect(struct mosquitto *mosq, void *userdata, int rc)
     fprintf(stderr, "iotd: disconnected (rc=%d)\n", rc);
 }
 
+/* ------------------------------------------------------------------ */
+/* Programme principal                                                 */
+/* ------------------------------------------------------------------ */
+
 int main(void)
 {
-    struct iotd_config cfg;
+    struct iotd_app app;
     struct mosquitto *mosq;
+    struct sigaction sa;
     time_t next_publish = 0;
     int rc;
 
-    if (load_config(&cfg) != 0)
+    memset(&app, 0, sizeof(app));
+
+    if (load_config(&app.cfg) != 0)
         return EXIT_FAILURE;
 
-    fprintf(stderr, "iotd: enabled=%d broker=%s port=%d topic=%s interval=%d\n",
-            cfg.enabled, cfg.broker, cfg.port, cfg.topic, cfg.interval);
+    snprintf(app.avail_topic, sizeof(app.avail_topic), "%s/availability",
+             app.cfg.topic);
 
-    if (!cfg.enabled) {
+    fprintf(stderr, "iotd: enabled=%d broker=%s port=%d topic=%s interval=%d\n",
+            app.cfg.enabled, app.cfg.broker, app.cfg.port, app.cfg.topic,
+            app.cfg.interval);
+
+    if (!app.cfg.enabled) {
         fprintf(stderr, "iotd: disabled in configuration, exiting\n");
         return EXIT_SUCCESS;
     }
 
+    /* Arret propre sur SIGTERM (procd, kill) et SIGINT (Ctrl+C) */
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+
     mosquitto_lib_init();
 
-    mosq = mosquitto_new("iotd", true, NULL);
+    /* &app est transmis aux callbacks (parametre userdata) */
+    mosq = mosquitto_new("iotd", true, &app);
     if (mosq == NULL) {
         fprintf(stderr, "iotd: mosquitto_new failed\n");
         mosquitto_lib_cleanup();
@@ -173,43 +295,59 @@ int main(void)
     mosquitto_connect_callback_set(mosq, on_connect);
     mosquitto_disconnect_callback_set(mosq, on_disconnect);
 
-    /* Premier essai. En cas d'echec, on ne quitte pas :
-     * la boucle ci-dessous se charge de reessayer. */
-    rc = mosquitto_connect(mosq, cfg.broker, cfg.port, 60);
+    /* Testament : publie par le broker si la passerelle disparait
+     * sans se deconnecter proprement. A definir AVANT la connexion. */
+    mosquitto_will_set(mosq, app.avail_topic,
+                       (int)strlen("offline"), "offline", 1, true);
+
+    rc = mosquitto_connect(mosq, app.cfg.broker, app.cfg.port, 60);
     if (rc != MOSQ_ERR_SUCCESS)
         fprintf(stderr, "iotd: initial connect failed: %s\n",
                 mosquitto_strerror(rc));
 
-    for (;;) {
-        /* Gere le reseau : envoi, reception, acquittements, keepalive.
-         * Attend au plus 1000 ms qu'il se passe quelque chose. */
+    while (g_running) {
         rc = mosquitto_loop(mosq, 1000, 1);
+        if (!g_running)
+            break;
+
         if (rc != MOSQ_ERR_SUCCESS) {
             fprintf(stderr, "iotd: %s, retrying in 5 s\n",
                     mosquitto_strerror(rc));
-            sleep(5);
-            mosquitto_reconnect(mosq);
+            sleep(5);           /* interrompu immediatement par un signal */
+            if (!g_running)
+                break;
+
+            rc = mosquitto_reconnect(mosq);
+            if (rc != MOSQ_ERR_SUCCESS)     /* journaliser la vraie cause */
+                fprintf(stderr, "iotd: reconnect failed: %s\n",
+                        mosquitto_strerror(rc));
             continue;
         }
 
         if (now_monotonic() >= next_publish) {
-            char payload[64];
-            double uptime = 0.0;
+            char payload[1024];
 
-            read_uptime(&uptime);
-            snprintf(payload, sizeof(payload), "uptime=%.0f", uptime);
+            if (build_status_json(payload, sizeof(payload)) == 0) {
+                rc = mosquitto_publish(mosq, NULL, app.cfg.topic,
+                                       (int)strlen(payload), payload, 1, false);
+                if (rc != MOSQ_ERR_SUCCESS)
+                    fprintf(stderr, "iotd: publish failed: %s\n",
+                            mosquitto_strerror(rc));
+            } else {
+                fprintf(stderr, "iotd: status too large for buffer\n");
+            }
 
-            rc = mosquitto_publish(mosq, NULL, cfg.topic,
-                                   (int)strlen(payload), payload, 1, false);
-            if (rc != MOSQ_ERR_SUCCESS)
-                fprintf(stderr, "iotd: publish failed: %s\n",
-                        mosquitto_strerror(rc));
-
-            next_publish = now_monotonic() + cfg.interval;
+            next_publish = now_monotonic() + app.cfg.interval;
         }
     }
 
-    /* Non atteint pour l'instant : la v4 ajoutera un arret propre sur SIGTERM. */
+    /* Arret propre : on annonce "offline" soi-meme, car le broker
+     * n'envoie pas le testament lors d'une deconnexion normale. */
+    fprintf(stderr, "iotd: stopping\n");
+    mosquitto_publish(mosq, NULL, app.avail_topic,
+                      (int)strlen("offline"), "offline", 1, true);
+    mosquitto_loop(mosq, 500, 1);   /* laisser le temps d'envoyer le message */
+    mosquitto_disconnect(mosq);
     mosquitto_destroy(mosq);
     mosquitto_lib_cleanup();
     return EXIT_SUCCESS;
