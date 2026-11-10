@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=iotd
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=4
+PKG_RELEASE:=5
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=Wael Rekik
 
@@ -31,8 +31,8 @@ endef
 
 define Build/Compile
 	$(TARGET_CC) $(TARGET_CPPFLAGS) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) \
-		-Wall -Wextra -o $(PKG_BUILD_DIR)/iotd $(PKG_BUILD_DIR)/iotd.c \
-		-lmosquitto -luci
+	    -Wall -Wextra -o $(PKG_BUILD_DIR)/iotd $(PKG_BUILD_DIR)/iotd.c \
+	    -lmosquitto -luci
 endef
 
 define Package/iotd/install
@@ -40,6 +40,8 @@ define Package/iotd/install
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/iotd $(1)/usr/bin/
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/iotd.config $(1)/etc/config/iotd
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/iotd.init $(1)/etc/init.d/iotd
 endef
 
 $(eval $(call BuildPackage,iotd))
