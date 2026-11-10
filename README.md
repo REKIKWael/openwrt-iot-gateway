@@ -11,13 +11,15 @@ Testée sous QEMU.
 - **Paquet `iotd`** : recette OpenWrt, démon C, configuration UCI et service procd
 - **Configuration réseau au premier démarrage** : script `uci-defaults` qui crée l'interface WAN
 - **Résultat** : l'image démarre directement en passerelle opérationnelle, sans configuration manuelle
-+---------------- OpenWrt (QEMU) ----------------+ +---- Hôte (Ubuntu / WSL2) ----+
-| procd -> iotd | MQTT | |
-| lit /etc/config/iotd (libuci) | --------> | broker mosquitto |
-| publie l’état réseau en JSON (libmosquitto) | TCP 1883 | mosquitto_sub ‘gateway/#’ |
-| WAN eth1 (DHCP) 10.0.2.15 | | 10.0.2.2 |
-+------------------------------------------------+ +------------------------------+
 
+```
++---------------- OpenWrt (QEMU) ----------------+           +---- Hôte (Ubuntu / WSL2) ----+
+| procd -> iotd                                  |   MQTT    |                              |
+|   lit /etc/config/iotd (libuci)                | --------> | broker mosquitto             |
+|   publie l'état réseau en JSON (libmosquitto)  |  TCP 1883 | mosquitto_sub 'gateway/#'    |
+|   WAN eth1 (DHCP) 10.0.2.15                    |           | 10.0.2.2                     |
++------------------------------------------------+           +------------------------------+
+```
 
 ## Le démon `iotd`
 
@@ -31,33 +33,36 @@ Testée sous QEMU.
 
 Exemple de messages reçus :
 
+```
 gateway/status/availability online
-gateway/status {“hostname”:”OpenWrt”,”uptime”:76,”interfaces”:[{“name”:”eth1",”ipv4":”10.0.2.15"},{“name”:”br-lan”,”ipv4":”192.168.1.1"}]}
-
+gateway/status {"hostname":"OpenWrt","uptime":76,"interfaces":[{"name":"eth1","ipv4":"10.0.2.15"},{"name":"br-lan","ipv4":"192.168.1.1"}]}
+```
 
 Configuration (`/etc/config/iotd`) :
 
-config iotd ‘main’
-option enabled ‘1’
-option broker ‘10.0.2.2’
-option port ‘1883’
-option topic ‘gateway/status’
-option interval ‘10’
-
+```
+config iotd 'main'
+    option enabled '1'
+    option broker '10.0.2.2'
+    option port '1883'
+    option topic 'gateway/status'
+    option interval '10'
+```
 
 ## Structure du dépôt
 
+```
 package/iotd/
-├── Makefile recette du paquet OpenWrt
-├── src/iotd.c démon C
+├── Makefile              recette du paquet OpenWrt
+├── src/iotd.c            démon C
 └── files/
-├── iotd.config configuration UCI par défaut (conffiles)
-└── iotd.init script d’init procd
+    ├── iotd.config       configuration UCI par défaut (conffiles)
+    └── iotd.init         script d'init procd
 image-files/etc/uci-defaults/
-└── 99-gateway-network configuration réseau au premier démarrage
-configs/diffconfig configuration minimale du build
-scripts/build.sh reconstruction complète de l’image
-
+└── 99-gateway-network    configuration réseau au premier démarrage
+configs/diffconfig        configuration minimale du build
+scripts/build.sh          reconstruction complète de l'image
+```
 
 ## Reproduire
 
