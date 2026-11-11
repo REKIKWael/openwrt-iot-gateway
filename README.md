@@ -1,4 +1,4 @@
-# Passerelle IoT OpenWrt : démon MQTT en C
+# Passerelle IoT OpenWrt et Matter
 
 Projet personnel de montée en compétence sur OpenWrt (novembre 2026).
 Image OpenWrt 25.12 construite depuis les sources pour une cible x86_64,
@@ -116,6 +116,60 @@ Dans le réseau `user` de QEMU, l'hôte est joignable à l'adresse `10.0.2.2`.
 - Lecture de l'état réseau via **ubus** (netifd) plutôt que `getifaddrs`
 - Délai de reconnexion fixe : passer à un délai croissant (backoff exponentiel)
 - Testé sous QEMU uniquement, pas sur du matériel réel
+
+## Extension : pont MQTT ↔ Matter
+
+Prise en main du SDK Matter officiel (`connectedhomeip` v1.6.1) sous Linux :
+
+- compilation de l'exemple d'ampoule (`lighting-app`) et du contrôleur `chip-tool` ;
+- mise en service sur le réseau IP : PASE (SPAKE2+), fail-safe, attestation DAC/PAI,
+  CSR, certificat opérationnel (NOC), ACL, puis sessions CASE ;
+- pilotage des clusters On/Off et Level Control, lecture du modèle de données (Descriptor).
+
+Le script `matter-bridge/matter_mqtt_bridge.py` relie MQTT et Matter :
+
+```
+mosquitto_pub -t home/light/set -m ON
+   -> broker MQTT -> pont Python -> chip-tool -> Matter (CASE) -> ampoule
+   <- home/light/state {"on": true, "level": 50}
+```
+
+| Topic | Rôle |
+|---|---|
+| `home/light/set` | `ON`, `OFF`, `TOGGLE` ou un niveau de 0 à 254 |
+| `home/light/state` | état JSON, message retenu |
+| `home/light/availability` | `online` / `offline`, avec testament MQTT |
+
+Choix de conception :
+
+- file de commandes et **fil de travail unique** : chip-tool n'est jamais lancé en parallèle ;
+- **validation stricte** des messages, et appel de chip-tool **sans shell** : protection contre
+  l'injection de commande, testée avec le message `ON; touch /tmp/pirate` ;
+- relecture périodique de l'état (un autre contrôleur peut agir sur l'ampoule : multi-admin).
+
+### Reproduire
+
+```sh
+git clone --depth 1 --branch v1.6.1.0 https://github.com/project-chip/connectedhomeip.git
+cd connectedhomeip
+./scripts/checkout_submodules.py --shallow --platform linux
+source scripts/bootstrap.sh
+./scripts/examples/gn_build_example.sh examples/lighting-app/linux out/lighting
+./scripts/examples/gn_build_example.sh examples/chip-tool out/chip-tool
+
+./out/lighting/chip-lighting-app &                        # l'ampoule
+./out/chip-tool/chip-tool pairing onnetwork 1 20202021    # mise en service
+python3 ../openwrt-iot-gateway/matter-bridge/matter_mqtt_bridge.py
+```
+
+Dépendances Ubuntu supplémentaires : `libevent-dev`, `avahi-daemon`, `python3-paho-mqtt`.
+
+### Limites
+
+- Mise en service par le réseau IP : pas de BLE sous WSL2, et pas de Thread (pas de radio 802.15.4)
+- Le pont lance chip-tool à chaque commande, donc une session CASE par commande. Une version de
+  production garderait la session ouverte et s'abonnerait aux changements d'attributs.
+- Le pont tourne sur le PC hôte, pas encore dans l'image OpenWrt
 
 ## Licence
 
